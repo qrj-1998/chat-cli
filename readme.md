@@ -1,0 +1,1 @@
+node /bin/web-chat-cli --url=
