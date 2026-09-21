@@ -1,1 +1,1 @@
-node /bin/web-chat-cli --url=
+node ./bin/web-chat-cli --url=
