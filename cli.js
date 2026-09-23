@@ -46,6 +46,13 @@ class ChatCli extends EventEmitter {
 
     this.painter = makePainter(options.color !== false)
     this.width = options.width || 80
+    /**
+     * 启动时预取多少条历史。
+     * 默认 20：终端一打开就能看到"刚才发生了什么"，不必等别人再说话。
+     * 数据来自欢迎帧自带的 recent（服务端按 HISTORY_PAGE_SIZE，默认 50 条上限），
+     * 所以这个数字超过服务端上限时只能给到上限，会明确提示。
+     */
+    this.historyLimit = Number.isFinite(options.historyLimit) ? Math.max(0, options.historyLimit) : 20
     this.state = 'idle'
     this.socket = null
     this.pendingNickname = null
@@ -139,12 +146,17 @@ class ChatCli extends EventEmitter {
             return
           }
           this.setState('chatting')
-          finish(resolve, { known: frame.known, user: frame.user, recent: frame.recent || [] })
+          finish(resolve, {
+            known: frame.known,
+            user: frame.user,
+            recent: frame.recent || [],
+            latestMessageId: frame.latestMessageId || 0
+          })
         } else if (frame.type === 'onboard' && nickname) {
           socket.send(JSON.stringify({ type: 'nickname', nickname, avatar: frame.avatar }))
         } else if (frame.type === 'registered') {
           this.setState('chatting')
-          finish(resolve, { known: true, user: frame.user, recent: [] })
+          finish(resolve, { known: true, user: frame.user, recent: [], latestMessageId: 0 })
         }
       }
     })
@@ -239,6 +251,22 @@ class ChatCli extends EventEmitter {
       this.socket.close(1000, 'cli exit')
     }
     this.setState('closed')
+  }
+
+  /**
+   * 从欢迎帧的 recent 里取出启动时要显示的那一段（最后 N 条）。
+   * 单独成方法是为了可测：切片规则、0 条、超上限的提示都靠它统一。
+   */
+  pickHistory(recent = []) {
+    const all = Array.isArray(recent) ? recent : []
+    if (!this.historyLimit) return { messages: [], truncated: false, available: all.length }
+    const messages = all.slice(-this.historyLimit)
+    return {
+      messages,
+      // 想看的条数多于服务端这次给的，说明还有更早的历史页没取
+      truncated: all.length < this.historyLimit,
+      available: all.length
+    }
   }
 
   /**

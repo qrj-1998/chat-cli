@@ -35,6 +35,7 @@ const HELP = `
   -n, --nick <昵称>      昵称；新设备首次运行用它可跳过输入提示
       --say <文本>       发一条消息后退出（不进交互模式）
       --read [N]         打印最近 N 条消息后退出（默认 20）
+      --history [N]      进聊天室时先显示最近 N 条历史（默认 20；0 表示不显示）
       --fp <字符串>      覆盖设备指纹（模拟另一台设备）
       --config-dir <目录> 会话存档目录（默认 ~/.config/web-chat-cli）
       --no-color         关闭彩色输出
@@ -47,6 +48,7 @@ const HELP = `
   /nick <昵称>       改昵称
   /users             列出在线的人
   /whoami            我是谁（昵称 / 设备指纹 / 存档路径）
+  /history [N]       再往前翻 N 条历史（默认 20）
   /open              用浏览器打开最近一张图片
   /day               打印一条记录分隔线（手账感）
   /clear             清屏
@@ -63,6 +65,7 @@ function parseArgs(argv) {
     nick: null,
     say: null,
     read: null,
+    history: 20,
     fp: null,
     configDir: defaultConfigDir(),
     color: null,
@@ -88,6 +91,9 @@ function parseArgs(argv) {
       case '--read':
         options.read = /^\d+$/.test(argv[i + 1] || '') ? Number(next()) : 20
         break
+      case '--history':
+        options.history = /^\d+$/.test(argv[i + 1] || '') ? Number(next()) : 20
+        break
       case '--fp':
         options.fp = next()
         break
@@ -112,6 +118,7 @@ function parseArgs(argv) {
         if (arg.startsWith('--url=')) options.url = arg.slice(6)
         else if (arg.startsWith('--nick=')) options.nick = arg.slice(7)
         else if (arg.startsWith('--say=')) options.say = arg.slice(6)
+        else if (arg.startsWith('--history=')) options.history = Number(arg.slice(10)) || 0
         else if (arg.startsWith('--fp=')) options.fp = arg.slice(5)
         else if (arg.startsWith('--config-dir=')) options.configDir = arg.slice(13)
         else {
@@ -151,7 +158,8 @@ async function main() {
     configDir: options.configDir,
     fingerprintOverride: options.fp,
     color: pickColor(options),
-    width: process.stdout.columns || 80
+    width: process.stdout.columns || 80,
+    historyLimit: Number.isFinite(options.history) ? options.history : 20
   })
 
   if (options.read !== null) return runRead(cli, options)
@@ -215,14 +223,48 @@ async function runInteractive(cli, options) {
   }
 
   out(`正在连接 ${cli.serverUrl} …`)
-  await cli.connect({ nickname })
+  const connected = await cli.connect({ nickname })
   out(`已进入聊天室，当前身份：${cli.nickname}`)
+
+  // 启动时先把最近的消息铺出来，避免"打开终端时空空如也、错过刚发生的事"。
+  // 数据来自欢迎帧自带的 recent（服务端按 HISTORY_PAGE_SIZE 给，默认上限 50）。
+  const history = cli.pickHistory(connected.recent)
+  const seen = new Set()
+
+  if (cli.historyLimit === 0) {
+    out('（已按 --history 0 跳过历史消息）')
+  } else if (history.messages.length === 0) {
+    out('（这个聊天室还没有历史消息）')
+  } else {
+    out('')
+    out(cli.painter.gray(`── 最近 ${history.messages.length} 条历史 ──`))
+    let lastDay = null
+    for (const message of history.messages) {
+      seen.add(message.id)
+      const day = new Date(message.createdAt).toDateString()
+      if (day !== lastDay) {
+        out(cli.formatDaySeparator(message.createdAt))
+        lastDay = day
+      }
+      out(cli.formatMessage(message).join('\n'))
+    }
+    out(cli.painter.gray('── 以上是历史，下面是实时消息 ──'))
+    if (history.truncated) {
+      out(cli.painter.gray(`（更早的记录还在服务端，用 /history 继续往前翻）`))
+    }
+  }
+
+  out('')
   out('输入内容回车发送；/help 看命令；Ctrl+C 退出。')
   out('')
 
   return new Promise((resolve) => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: '› ' })
-    let lastDay = new Date().toDateString()
+    // 注意：历史已经用 out() 直接打印并推进了 lastDay，
+    // 实时消息的"换天分隔线"必须从这里接着算，否则会重复插入分隔线。
+    let lastDay = history.messages.length
+      ? new Date(history.messages[history.messages.length - 1].createdAt).toDateString()
+      : new Date().toDateString()
 
     const printLines = (lines) => {
       readline.clearLine(process.stdout, 0)
@@ -231,8 +273,6 @@ async function runInteractive(cli, options) {
       rl.prompt(true)
     }
 
-    // 历史消息先铺一遍，接着进入实时模式
-    const seen = new Set()
     const printMessage = (message) => {
       if (seen.has(message.id)) return
       seen.add(message.id)
@@ -297,6 +337,16 @@ async function runInteractive(cli, options) {
           out(`已在浏览器打开：${url}`)
           return
         }
+        case '/history': {
+          const count = Number(argument) > 0 ? Number(argument) : 20
+          out(cli.painter.gray('正在读取更早的记录…'))
+          loadOlderHistory(cli, count, seen)
+            .then((loaded) => {
+              if (!loaded) out('没有更早的记录可翻了')
+            })
+            .catch((err) => out(`读取失败：${err.message}`))
+          return
+        }
         case '/day':
           out(cli.formatDaySeparator(Date.now()))
           return
@@ -344,6 +394,36 @@ async function runInteractive(cli, options) {
 
     rl.prompt()
   })
+}
+
+/**
+ * 往前翻历史（/history 命令）。
+ *
+ * 走 HTTP 分页接口而不是 WebSocket：欢迎帧只给最近一页，更早的内容只能按 id 往前要。
+ * before=<当前已知最小 id> 保证不会和已显示的内容重叠。
+ */
+async function loadOlderHistory(cli, count, seen) {
+  const known = [...seen].filter((id) => typeof id === 'number' && id > 0)
+  const before = known.length ? Math.min(...known) : undefined
+  const url = `${cli.serverUrl}/api/messages?limit=${Math.min(count, 200)}${before ? `&before=${before}` : ''}`
+  const response = await fetch(url)
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  const payload = await response.json()
+  const messages = (payload.messages || []).filter((message) => !seen.has(message.id))
+  if (!messages.length) return 0
+
+  process.stdout.write(`${cli.painter.gray(`── 更早的 ${messages.length} 条 ──`)}\n`)
+  let lastDay = null
+  for (const message of messages) {
+    seen.add(message.id)
+    const day = new Date(message.createdAt).toDateString()
+    if (day !== lastDay) {
+      process.stdout.write(`${cli.formatDaySeparator(message.createdAt)}\n`)
+      lastDay = day
+    }
+    process.stdout.write(`${cli.formatMessage(message).join('\n')}\n`)
+  }
+  return messages.length
 }
 
 /** 单次提问（只为拿昵称，用独立的 readline）。 */
