@@ -55,6 +55,7 @@ class ChatCli extends EventEmitter {
     this.historyLimit = Number.isFinite(options.historyLimit) ? Math.max(0, options.historyLimit) : 20
     this.state = 'idle'
     this.socket = null
+    this.stopRequested = false
     this.pendingNickname = null
     this.openImages = []
     this.imageHintShown = false
@@ -103,13 +104,17 @@ class ChatCli extends EventEmitter {
   connect({ nickname = null, timeoutMs = 8000 } = {}) {
     return new Promise((resolve, reject) => {
       let settled = false
+      let closed = false
+      let connected = false
+      this.stopRequested = false
+      this.setState('connecting')
       const socket = this.webSocketFactory(this.wsUrl)
       this.socket = socket
 
       const timer = setTimeout(() => {
         if (settled) return
-        settled = true
-        reject(new Error(`握手超时（${timeoutMs}ms），检查服务端是否可达：${this.wsUrl}`))
+        finish(reject, new Error(`握手超时（${timeoutMs}ms），检查服务端是否可达：${this.wsUrl}`))
+        socket.close()
       }, timeoutMs)
 
       const finish = (fn, value) => {
@@ -120,19 +125,25 @@ class ChatCli extends EventEmitter {
       }
 
       socket.onopen = () => {
+        if (this.socket !== socket || closed) return
         socket.send(JSON.stringify({ type: 'hello', fpHash: this.fingerprint, token: this.token }))
       }
       socket.onerror = () => {
+        if (this.socket !== socket || closed) return
         const err = new Error(`WebSocket 连接失败：${this.wsUrl}`)
-        this.emit('error', err)
-        finish(reject, err)
+        if (!settled) finish(reject, err)
+        if (socket.readyState === 0 || socket.readyState === 1) socket.close()
       }
       socket.onclose = () => {
-        this.emit('closed')
+        if (this.socket !== socket || closed) return
+        closed = true
+        this.socket = null
         if (this.state !== 'closed') this.setState('closed')
-        finish(reject, new Error('连接在握手完成前被关闭'))
+        if (!settled) finish(reject, new Error('连接在握手完成前被关闭'))
+        else if (connected && !this.stopRequested) this.emit('closed')
       }
       socket.onmessage = (event) => {
+        if (this.socket !== socket || closed) return
         let frame
         try {
           frame = JSON.parse(event.data)
@@ -146,6 +157,7 @@ class ChatCli extends EventEmitter {
             return
           }
           this.setState('chatting')
+          connected = true
           finish(resolve, {
             known: frame.known,
             user: frame.user,
@@ -156,6 +168,7 @@ class ChatCli extends EventEmitter {
           socket.send(JSON.stringify({ type: 'nickname', nickname, avatar: frame.avatar }))
         } else if (frame.type === 'registered') {
           this.setState('chatting')
+          connected = true
           finish(resolve, { known: true, user: frame.user, recent: [], latestMessageId: 0 })
         }
       }
@@ -226,8 +239,6 @@ class ChatCli extends EventEmitter {
   /** 发一条文本消息。返回 clientId（服务端会用 ack 回同一个 id）。 */
   say(text, clientId = `cli-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`) {
     if (!this.socket || this.socket.readyState !== 1) {
-      const err = new Error('还没连上服务器')
-      this.emit('error', err)
       return null
     }
     this.socket.send(JSON.stringify({ type: 'message', clientId, text }))
@@ -247,7 +258,8 @@ class ChatCli extends EventEmitter {
   }
 
   close() {
-    if (this.socket && this.socket.readyState === 1) {
+    this.stopRequested = true
+    if (this.socket && (this.socket.readyState === 0 || this.socket.readyState === 1)) {
       this.socket.close(1000, 'cli exit')
     }
     this.setState('closed')

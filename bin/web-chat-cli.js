@@ -122,8 +122,9 @@ function parseArgs(argv) {
         else if (arg.startsWith('--fp=')) options.fp = arg.slice(5)
         else if (arg.startsWith('--config-dir=')) options.configDir = arg.slice(13)
         else {
-          process.stderr.write(`未知参数：${arg}\n用 --help 看用法\n`)
-          process.exit(2)
+          const error = new Error(`未知参数：${arg}\n用 --help 看用法`)
+          error.exitCode = 2
+          throw error
         }
     }
   }
@@ -260,6 +261,10 @@ async function runInteractive(cli, options) {
 
   return new Promise((resolve) => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: '› ' })
+    let reconnectTimer = null
+    let reconnectAttempt = 0
+    let stopped = false
+    let lastMessageId = cli.latestMessageId
     // 注意：历史已经用 out() 直接打印并推进了 lastDay，
     // 实时消息的"换天分隔线"必须从这里接着算，否则会重复插入分隔线。
     let lastDay = history.messages.length
@@ -267,6 +272,7 @@ async function runInteractive(cli, options) {
       : new Date().toDateString()
 
     const printLines = (lines) => {
+      if (stopped) return
       readline.clearLine(process.stdout, 0)
       readline.cursorTo(process.stdout, 0)
       for (const line of lines) out(line)
@@ -276,6 +282,7 @@ async function runInteractive(cli, options) {
     const printMessage = (message) => {
       if (seen.has(message.id)) return
       seen.add(message.id)
+      if (typeof message.id === 'number') lastMessageId = Math.max(lastMessageId, message.id)
       const day = new Date(message.createdAt).toDateString()
       const lines = []
       if (day !== lastDay) {
@@ -284,6 +291,34 @@ async function runInteractive(cli, options) {
       }
       lines.push(...cli.formatMessage(message))
       printLines(lines)
+    }
+
+    const reconnect = () => {
+      if (stopped || reconnectTimer) return
+      const delay = Math.min(1000 * 2 ** reconnectAttempt, 30000)
+      reconnectAttempt += 1
+      printLines([`  ${cli.painter.yellow(`将在 ${delay / 1000} 秒后重连…`)}`])
+      reconnectTimer = setTimeout(async () => {
+        reconnectTimer = null
+        if (stopped) return
+        try {
+          const restored = await cli.connect({ nickname: cli.nickname || nickname })
+          if (stopped) {
+            cli.close()
+            return
+          }
+          reconnectAttempt = 0
+          printLines([`  ${cli.painter.green('连接已恢复')}`])
+          for (const message of restored.recent) {
+            if (typeof message.id === 'number' && message.id > lastMessageId) printMessage(message)
+          }
+          lastMessageId = Math.max(lastMessageId, cli.latestMessageId)
+        } catch (error) {
+          if (stopped) return
+          printLines([`  ${cli.painter.yellow(`重连失败：${error.message}`)}`])
+          reconnect()
+        }
+      }, delay)
     }
 
     cli.on('message', printMessage)
@@ -298,8 +333,7 @@ async function runInteractive(cli, options) {
     })
     cli.on('closed', () => {
       printLines([`  ${cli.painter.yellow('连接已断开')}`])
-      rl.close()
-      resolve(0)
+      reconnect()
     })
 
     const handleCommand = (line) => {
@@ -372,7 +406,7 @@ async function runInteractive(cli, options) {
       }
       if (text.startsWith('/')) {
         handleCommand(text)
-        rl.prompt()
+        if (!stopped) rl.prompt()
         return
       }
       const clientId = cli.say(text)
@@ -381,6 +415,10 @@ async function runInteractive(cli, options) {
     })
 
     rl.on('close', () => {
+      stopped = true
+      if (reconnectTimer) clearTimeout(reconnectTimer)
+      process.stdin.pause()
+      if (typeof process.stdin.unref === 'function') process.stdin.unref()
       cli.close()
       resolve(0)
     })
@@ -452,8 +490,8 @@ function openInBrowser(url) {
 }
 
 main()
-  .then((code) => process.exit(code || 0))
+  .then((code) => { process.exitCode = code || 0 })
   .catch((err) => {
     process.stderr.write(`出错了：${err.message}\n`)
-    process.exit(1)
+    process.exitCode = err.exitCode || 1
   })
